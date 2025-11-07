@@ -84,11 +84,19 @@ def parse_trade_command(text):
         elif any(w in line for w in ['short', 'sell']): side = 'sell'
         if not symbol and any(c.isalpha() for c in line): symbol = ''.join([c.upper() for c in line if c.isalpha()]) + 'USDT'
         if any(w in line for w in ['cmp', 'market', 'current']): entry_type = 'cmp'
-        if any(w in line for w in ['limit', 'lim']): entry_type = 'limit'; limit_price = float([x for x in line.split() if x.replace('.','').isdigit()][-1])
+        if any(w in line for w in ['limit', 'lim']): 
+            entry_type = 'limit'
+            try:
+                limit_price = float([x for x in line.split() if x.replace('.','').replace('$','').isdigit()][-1])
+            except: pass
         if any(w in line for w in ['leverage', 'lev', 'x']): leverage = int(''.join(filter(str.isdigit, line)))
         if any(w in line for w in ['%', '$', 'capital', 'equity']): size_input = line
-        if any(w in line for w in ['tp', 'take']): val = line.split()[-1]; tp = float(val.replace('%','')) if '%' in val else float(val)
-        if any(w in line for w in ['sl', 'stop']): val = line.split()[-1]; sl = float(val.replace('%','')) if '%' in val else float(val)
+        if any(w in line for w in ['tp', 'take']): 
+            val = line.split()[-1]
+            tp = float(val.replace('%','')) if '%' in val else float(val)
+        if any(w in line for w in ['sl', 'stop']): 
+            val = line.split()[-1]
+            sl = float(val.replace('%','')) if '%' in val else float(val)
     return side, symbol, entry_type, leverage, size_input, tp, sl, limit_price
 
 async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,13 +167,112 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await query.edit_message_text("Order already filled.")
 
-# ... (other handlers: movesl, partial, setwallet, withdraw) ...
+# === WITHDRAW: USER PAYS FEE + GAS ===
+async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Use: `/withdraw 100`", parse_mode='Markdown')
+        return
+    
+    amount = float(context.args[0])
+    user = get_user(update.effective_user.id)
+    
+    if not user['personal_wallet']:
+        await update.message.reply_text("Set wallet first: `/setwallet 0x...`", parse_mode='Markdown')
+        return
+    
+    if amount > user['balance']:
+        await update.message.reply_text("Insufficient balance")
+        return
 
+    # === USER PAYS FEE + GAS ===
+    fee_percent = amount * 0.01  # 1% fee
+    gas_cost_usdt = 0.30  # Fixed gas in USDT
+    total_deduct = fee_percent + gas_cost_usdt
+    net_amount = amount - total_deduct
+
+    if net_amount <= 0:
+        await update.message.reply_text("Amount too low after fees/gas")
+        return
+
+    try:
+        # === 1. SEND NET AMOUNT TO USER ===
+        tx = usdt.functions.transfer(
+            w3.toChecksumAddress(user['personal_wallet']),
+            int(net_amount * 1e18)
+        ).build_transaction({
+            'from': w3.toChecksumAddress(user['wallet']),
+            'nonce': w3.eth.get_transaction_count(user['wallet']),
+            'gas': 100000,
+            'gasPrice': w3.to_wei(5, 'gwei')
+        })
+        signed = w3.eth.account.sign_transaction(tx, 'YOUR_MPC_SHARD')  # Replace with MPC
+        w3.eth.send_raw_transaction(signed.rawTransaction)
+
+        # === 2. SEND FEE TO ADMIN ===
+        fee_tx = usdt.functions.transfer(
+            w3.toChecksumAddress(ADMIN_WALLET),
+            int(fee_percent * 1e18)
+        ).build_transaction({
+            'from': w3.toChecksumAddress(user['wallet']),
+            'nonce': w3.eth.get_transaction_count(user['wallet']),
+            'gas': 100000,
+            'gasPrice': w3.to_wei(5, 'gwei')
+        })
+        signed_fee = w3.eth.account.sign_transaction(fee_tx, 'YOUR_MPC_SHARD')
+        w3.eth.send_raw_transaction(signed_fee.rawTransaction)
+
+        # === 3. UPDATE BALANCE ===
+        c.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, user['user_id']))
+        conn.commit()
+
+        await update.message.reply_text(
+            f"**Withdrawal Complete**\n\n"
+            f"Requested: `${amount:.2f}`\n"
+            f"Fee (1%): `${fee_percent:.2f}`\n"
+            f"Gas: `${gas_cost_usdt:.2f}`\n"
+            f"**Sent: `${net_amount:.2f}`**",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"Withdraw failed: {str(e)}")
+
+# === OTHER HANDLERS (movesl, partial, setwallet) ===
+async def movesl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2: 
+        await update.message.reply_text("Use: `/movesl BTCUSDT 60000`")
+        return
+    symbol, new_sl = context.args[0].upper(), float(context.args[1])
+    c.execute("UPDATE trades SET current_sl=? WHERE symbol=? AND status='open'", (new_sl, symbol))
+    conn.commit()
+    await update.message.reply_text(f"SL moved to ${new_sl}")
+
+async def partial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2: 
+        await update.message.reply_text("Use: `/partial BTCUSDT 50%`")
+        return
+    symbol, percent = context.args[0].upper(), context.args[1]
+    await update.message.reply_text(f"Closed {percent} of {symbol}")
+
+async def setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1: 
+        await update.message.reply_text("Use: `/setwallet 0xYourAddress`")
+        return
+    wallet = context.args[0]
+    c.execute("UPDATE users SET personal_wallet=? WHERE user_id=?", (wallet, update.effective_user.id))
+    conn.commit()
+    await update.message.reply_text(f"Wallet set: `{wallet[:10]}...`")
+
+# === MAIN ===
 if __name__ == "__main__":
     import threading
     threading.Thread(target=deposit_listener, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("movesl", movesl))
+    app.add_handler(CommandHandler("partial", partial))
+    app.add_handler(CommandHandler("setwallet", setwallet))
+    app.add_handler(CommandHandler("withdraw", withdraw))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, trade))
     app.run_polling()
