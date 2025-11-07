@@ -1,4 +1,4 @@
 python-telegram-bot==20.8
 ccxt==4.3.20
 web3==6.15.1
-qrcode[pil]
+qrcode[pil]==9.0.0
