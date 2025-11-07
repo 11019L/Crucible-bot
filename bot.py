@@ -83,44 +83,63 @@ def deposit_listener():
             print("Deposit error:", e)
             time.sleep(5)
 
+# === ULTRA FLEXIBLE PARSING ===
 def parse_trade_command(text):
-    lines = [l.strip().lower() for l in text.split('\n') if l.strip()]
+    text = text.replace('/', ' ').replace('-', ' ').replace('usdt', 'USDT').replace('usd', 'USDT')
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    full_text = ' '.join(lines).lower()
+
     side = symbol = entry_type = leverage = size_input = tp = sl = limit_price = None
+
+    if any(w in full_text for w in ['long', 'buy']): side = 'buy'
+    elif any(w in full_text for w in ['short', 'sell']): side = 'sell'
+
+    for word in full_text.split():
+        if word.endswith('usdt') or word in ['btc', 'eth', 'sol', 'bnb', 'ada', 'xrp', 'doge', 'matic']:
+            symbol = word.upper()
+            if not symbol.endswith('USDT'): symbol += 'USDT'
+            break
+
+    if any(w in full_text for w in ['cmp', 'market', 'current', 'now']): entry_type = 'cmp'
+    elif any(w in full_text for w in ['limit', 'lim']): 
+        entry_type = 'limit'
+        for line in lines:
+            if 'limit' in line.lower():
+                nums = [x for x in line.split() if x.replace('.','').replace('$','').isdigit()]
+                if nums: limit_price = float(nums[0])
+
+    for word in full_text.split():
+        if 'x' in word or 'lev' in word:
+            nums = ''.join(filter(str.isdigit, word))
+            if nums: leverage = int(nums)
+
     for line in lines:
-        line = line.replace('/', ' ').replace('-', ' ')
-        if any(w in line for w in ['long', 'buy']): side = 'buy'
-        elif any(w in line for w in ['short', 'sell']): side = 'sell'
-        if not symbol and any(c.isalpha() for c in line): 
-            symbol = ''.join([c.upper() for c in line if c.isalpha()]) + 'USDT'
-        if any(w in line for w in ['cmp', 'market', 'current']): entry_type = 'cmp'
-        if any(w in line for w in ['limit', 'lim']): 
-            entry_type = 'limit'
-            try:
-                limit_price = float([x for x in line.split() if x.replace('.','').replace('$','').isdigit()][-1])
-            except: pass
-        if any(w in line for w in ['leverage', 'lev', 'x']): 
-            leverage = int(''.join(filter(str.isdigit, line)))
-        if any(w in line for w in ['%', '$', 'capital', 'equity']): size_input = line
-        if any(w in line for w in ['tp', 'take']): 
+        if any(c in line for c in ['$', '%']): 
+            size_input = line.strip()
+            break
+
+    for line in lines:
+        lower = line.lower()
+        if 'tp' in lower or 'take' in lower:
             val = line.split()[-1]
             tp = float(val.replace('%','')) if '%' in val else float(val)
-        if any(w in line for w in ['sl', 'stop']): 
+        if 'sl' in lower or 'stop' in lower:
             val = line.split()[-1]
             sl = float(val.replace('%','')) if '%' in val else float(val)
+
     return side, symbol, entry_type, leverage, size_input, tp, sl, limit_price
 
-# === TRADE COMMAND ===
+# === TRADE ===
 async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
     side, symbol, entry_type, leverage, size_input, tp, sl, limit_price = parse_trade_command(update.message.text)
     
     if not all([side, symbol, entry_type, leverage, size_input]):
         await update.message.reply_text(
-            "Invalid command. Example:\n"
-            "Long btc\n"
-            "Cmp\n"
-            "20x leverage\n"
-            "$50"
+            "Invalid trade. Examples:\n"
+            "• Long btc 20x $10\n"
+            "• btc/usdt cmp 50x 10%\n"
+            "• buy eth limit 3000 $20 tp 10%"
         )
         return
 
@@ -154,10 +173,10 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status = "PENDING LIMIT"
 
         silent_deduct(user['wallet'], fee, "trade_open")
-        trade_id = c.execute(
+        c.execute(
             "INSERT INTO trades (user_id, symbol, side, qty, entry, leverage, notional, fee, tp, sl, order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
             (user['user_id'], symbol, side, qty, price, leverage, notional, fee, tp, sl, order.get('id'))
-        ).lastrowid
+        )
         conn.commit()
 
         keyboard = [[InlineKeyboardButton("Cancel", callback_data=f"cancel_{order.get('id', '')}")]] if entry_type == 'limit' else []
@@ -167,7 +186,7 @@ async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception as e:
-        await update.message.reply_text(f"Error: {str(e)}")
+        await update.message.reply_text(f"Trade failed: {str(e)}")
 
 # === MENU ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -203,14 +222,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT symbol, side, entry, leverage, notional, status, timestamp 
             FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 10
         """, (user['user_id'],)).fetchall()
-        if not trades:
-            msg = "No trade history"
-        else:
-            msg = "Last 10 Trades:\n"
-            for t in trades:
-                symbol, side, entry, lev, notional, status, ts = t
-                msg += f"• {side.upper()} {symbol} @ ${entry:.2f}\n"
-                msg += f"  {lev}x | ${notional:.0f} | {status}\n\n"
+        msg = "Last 10 Trades:\n" if trades else "No trade history"
+        for t in trades:
+            symbol, side, entry, lev, notional, status, ts = t
+            msg += f"• {side.upper()} {symbol} @ ${entry:.2f}\n  {lev}x | ${notional:.0f} | {status}\n\n"
         await query.edit_message_text(msg)
 
     elif query.data == "trades":
@@ -218,26 +233,25 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT symbol, side, entry, leverage, notional FROM trades 
             WHERE user_id=? AND status='open'
         """, (user['user_id'],)).fetchall()
-        if not open_trades:
-            msg = "No open trades"
-        else:
-            msg = "Open Trades:\n"
-            for t in open_trades:
-                symbol, side, entry, lev, notional = t
-                msg += f"• {side.upper()} {symbol} @ ${entry:.2f}\n"
-                msg += f"  {lev}x | ${notional:.0f}\n\n"
+        msg = "Open Trades:\n" if open_trades else "No open trades"
+        for t in open_trades:
+            symbol, side, entry, lev, notional = t
+            msg += f"• {side.upper()} {symbol} @ ${entry:.2f}\n  {lev}x | ${notional:.0f}\n\n"
         await query.edit_message_text(msg)
 
     elif query.data == "withdraw":
         await query.edit_message_text(
-            "Use command:\n`/withdraw 50`\n\n"
-            "1% fee + $0.30 gas\nYou receive: $49.20",
+            "Just type any amount to withdraw:\n"
+            "• `50`\n"
+            "• `$25`\n"
+            "• `10.5`\n\n"
+            "1% fee + $0.30 gas",
             parse_mode='Markdown'
         )
 
     elif query.data == "setwallet":
         await query.edit_message_text(
-            "Use command:\n`/setwallet 0xYourWallet`",
+            "Use:\n`/setwallet 0xYourWallet`",
             parse_mode='Markdown'
         )
 
@@ -249,21 +263,22 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await query.edit_message_text("Order already filled.")
 
-# === WITHDRAW (USER PAYS FEE + GAS) ===
+# === WITHDRAW BY TYPING ANY NUMBER ===
 async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1:
-        await update.message.reply_text("Use: `/withdraw 100`", parse_mode='Markdown')
+    text = update.message.text.strip()
+    if text.startswith('$'): text = text[1:]
+    if not text.replace('.','').isdigit():
         return
     
-    amount = float(context.args[0])
+    amount = float(text)
     user = get_user(update.effective_user.id)
     
     if not user['personal_wallet']:
-        await update.message.reply_text("Set wallet first: `/setwallet 0x...`", parse_mode='Markdown')
+        await update.message.reply_text("Set wallet first:\n`/setwallet 0xYourAddress`", parse_mode='Markdown')
         return
     
     if amount > user['balance']:
-        await update.message.reply_text("Insufficient balance")
+        await update.message.reply_text(f"Insufficient balance. Need ${amount:.2f}")
         return
 
     fee_percent = amount * 0.01
@@ -272,11 +287,10 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     net_amount = amount - total_deduct
 
     if net_amount <= 0:
-        await update.message.reply_text("Amount too low after fees/gas")
+        await update.message.reply_text("Amount too low after fees")
         return
 
     try:
-        # SEND NET TO USER
         tx = usdt.functions.transfer(
             w3.toChecksumAddress(user['personal_wallet']),
             int(net_amount * 1e18)
@@ -286,10 +300,9 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'gas': 100000,
             'gasPrice': w3.to_wei(5, 'gwei')
         })
-        signed = w3.eth.account.sign_transaction(tx, 'YOUR_MPC_SHARD')  # REPLACE
+        signed = w3.eth.account.sign_transaction(tx, 'YOUR_MPC_SHARD')
         w3.eth.send_raw_transaction(signed.rawTransaction)
 
-        # SEND FEE TO ADMIN
         fee_tx = usdt.functions.transfer(
             w3.toChecksumAddress(ADMIN_WALLET),
             int(fee_percent * 1e18)
@@ -316,7 +329,7 @@ async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Withdraw failed: {str(e)}")
 
-# === OTHER COMMANDS ===
+# === SET WALLET ===
 async def setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 1: 
         await update.message.reply_text("Use: `/setwallet 0xYourAddress`")
@@ -333,7 +346,12 @@ if __name__ == "__main__":
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setwallet", setwallet))
-    app.add_handler(CommandHandler("withdraw", withdraw))
     app.add_handler(CallbackQueryHandler(button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, trade))
+    
+    # WITHDRAW: ANY NUMBER
+    app.add_handler(MessageHandler(filters.Regex(r'^(?:\d*\.)?\d+$|^(?:\$\d*\.)?\d+$'), withdraw))
+    
+    # TRADE: ANY TEXT (NOT COMMAND, NOT NUMBER)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^(?:\d*\.)?\d+$|^(?:\$\d*\.)?\d+$'), trade))
+    
     app.run_polling()
