@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: crucible-bot
-    env: python
-    pythonVersion: "3.11"
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
-    plan: free
-    autoDeploy: false
